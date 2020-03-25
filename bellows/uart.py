@@ -1,15 +1,20 @@
+from datetime import datetime
 import asyncio
 import binascii
 import logging
+import os
+import time
 
 from bellows.thread import EventLoopThread, ThreadsafeProxy
 import bellows.types as t
+import pure_pcapy
 import serial
 import serial_asyncio
 
 LOGGER = logging.getLogger(__name__)
 RESET_TIMEOUT = 5
 
+DLT_USER0 = 147  # Pcap link-layer user0 header type
 
 class Gateway(asyncio.Protocol):
     FLAG = b"\x7E"  # Marks end of frame
@@ -27,7 +32,7 @@ class Gateway(asyncio.Protocol):
     class Terminator:
         pass
 
-    def __init__(self, application, connected_future=None, connection_done_future=None):
+    def __init__(self, application, connected_future=None, connection_done_future=None, pcap_file=None):
         self._send_seq = 0
         self._rec_seq = 0
         self._buffer = b""
@@ -37,6 +42,24 @@ class Gateway(asyncio.Protocol):
         self._sendq = asyncio.Queue()
         self._pending = (-1, None)
         self._connection_done_future = connection_done_future
+        # Check if the environment variable override has been set
+        pcap_file = os.getenv("BELLOWS_SERIAL_PCAP", pcap_file)
+        if pcap_file:
+            # Perform time substitution using the current utc time
+            pcap_file = datetime.utcnow().strftime(pcap_file)
+            self._pcap = pure_pcapy.Dumper(pcap_file, 0, DLT_USER0)
+        else:
+            self._pcap = None
+
+    def _log_frame(self, data, recv_flag):
+        if self._pcap:
+            log_data = bytes([int(recv_flag)]) + data
+            ts = time.time()
+            ts_sec = int(ts)
+            ts_usec = int((ts - ts_sec) * 1000000)
+            hdr = pure_pcapy.Pkthdr(ts_sec, ts_usec, len(log_data), len(log_data))
+            self._pcap.dump(hdr, log_data)
+
 
     def connection_made(self, transport):
         """Callback when the uart is connected"""
@@ -69,6 +92,7 @@ class Gateway(asyncio.Protocol):
         """Extract a frame from the data buffer"""
         if self.FLAG in data:
             place = data.find(self.FLAG)
+            self._log_frame(data[:place + 1], True)  # Log raw stuffed frame
             frame = self._unstuff(data[: place + 1])
             rest = data[place + 1 :]
             crc = binascii.crc_hqx(frame[:-3], 0xFFFF)
@@ -175,6 +199,7 @@ class Gateway(asyncio.Protocol):
     def write(self, data):
         """Send data to the uart"""
         LOGGER.debug("Sending: %s", binascii.hexlify(data))
+        self._log_frame(data, False)
         self._transport.write(data)
 
     def close(self):
